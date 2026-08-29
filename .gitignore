@@ -1,0 +1,7 @@
+node_modules/
+.wwebjs_cache/
+auth_info/
+auth_info_backup/
+*.log
+*.err
+.env
