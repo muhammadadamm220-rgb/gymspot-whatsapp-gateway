@@ -44,8 +44,32 @@ app.use(cors({
 }));
 app.use(express.json());
 
+const fs = require('fs');
+
 let latestQr = "";
 let connectionStatus = "disconnected";
+
+const puppeteerArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-accelerated-2d-canvas',
+    '--no-first-run',
+    '--no-zygote',
+    '--disable-gpu',
+    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+];
+
+const puppeteerOptions = {
+    headless: true,
+    args: puppeteerArgs
+};
+
+if (process.platform === 'win32' && fs.existsSync('C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe')) {
+    puppeteerOptions.executablePath = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+} else if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    puppeteerOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+}
 
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './auth_info' }),
@@ -53,20 +77,7 @@ const client = new Client({
         type: 'remote',
         remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html'
     },
-    puppeteer: {
-        executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-        headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu',
-            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        ]
-    }
+    puppeteer: puppeteerOptions
 });
 
 client.on('qr', (qr) => {
@@ -299,15 +310,21 @@ app.post('/send-message', async (req, res) => {
 });
 
 
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
     console.log(`\n=======================================================`);
-    console.log(`GymSpot Local Gateway running on http://localhost:${PORT}`);
+    console.log(`GymSpot Gateway running on port ${PORT}`);
     console.log(`Status URL: http://localhost:${PORT}/status`);
     console.log(`QR Code URL: http://localhost:${PORT}/qr`);
     console.log(`=======================================================\n`);
     
-    startTunnel();
+    if (process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL) {
+        publicTunnelUrl = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL;
+        console.log(`\n🎉 [Cloud Gateway Public URL] -> ${publicTunnelUrl}\n`);
+        publishCloudUrl(publicTunnelUrl);
+    } else {
+        startTunnel();
+    }
 });
 
 const { exec } = require('child_process');
@@ -315,7 +332,21 @@ let publicTunnelUrl = '';
 let ltProcess = null;
 let consecutiveFailures = 0;
 
+async function publishCloudUrl(url) {
+    try {
+        const currentData = await extendsClassRequest('edebfad', 'GET');
+        await extendsClassRequest('edebfad', 'PUT', { 
+            ...currentData,
+            gatewayUrl: url
+        });
+        console.log('[Cloud Sync] Successfully published public URL to cloud database:', url);
+    } catch (err) {
+        console.error('[Cloud Sync] Failed to publish URL to cloud:', err.message);
+    }
+}
+
 const killProcessTree = (pid) => {
+    if (process.platform !== 'win32') return;
     try {
         console.log(`[Tunnel Kill] Terminating process tree for PID ${pid}...`);
         exec(`taskkill /pid ${pid} /f /t`, (err) => {
@@ -331,6 +362,9 @@ const killProcessTree = (pid) => {
 };
 
 function startTunnel() {
+    if (process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL) {
+        return; // Localtunnel not needed in production cloud hosts
+    }
     console.log('[Tunnel] Starting localtunnel on port 4000...');
     if (ltProcess) {
         try {
@@ -349,17 +383,7 @@ function startTunnel() {
         if (match) {
             publicTunnelUrl = match[1];
             console.log(`\n🎉 [Public Gateway URL] -> ${publicTunnelUrl}\n`);
-            
-            try {
-                const currentData = await extendsClassRequest('edebfad', 'GET');
-                await extendsClassRequest('edebfad', 'PUT', { 
-                    ...currentData,
-                    gatewayUrl: publicTunnelUrl
-                });
-                console.log('[Tunnel] Successfully published public URL to cloud database.');
-            } catch (err) {
-                console.error('[Tunnel] Failed to publish URL to cloud:', err.message);
-            }
+            publishCloudUrl(publicTunnelUrl);
         }
     };
 

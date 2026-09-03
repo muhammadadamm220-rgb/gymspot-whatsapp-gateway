@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "whatsapp-web.js": "^1.23.0",
+    "puppeteer": "^22.6.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "qrcode-terminal": "^0.12.0",
