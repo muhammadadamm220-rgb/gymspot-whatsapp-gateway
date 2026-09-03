@@ -65,16 +65,45 @@ const puppeteerArgs = [
     '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 ];
 
+function getExecutablePath() {
+    if (process.platform === 'win32') {
+        const winChrome = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+        if (fs.existsSync(winChrome)) return winChrome;
+    }
+    
+    // Check bundled cache path in Linux/Render
+    const cacheDir = path.resolve(__dirname, 'cache', 'puppeteer');
+    if (fs.existsSync(cacheDir)) {
+        const findChrome = (dir) => {
+            try {
+                const files = fs.readdirSync(dir);
+                for (const file of files) {
+                    const fullPath = path.join(dir, file);
+                    const stat = fs.statSync(fullPath);
+                    if (stat.isDirectory()) {
+                        const found = findChrome(fullPath);
+                        if (found) return found;
+                    } else if (file === 'chrome' || file === 'chrome.exe') {
+                        return fullPath;
+                    }
+                }
+            } catch (e) {}
+            return null;
+        };
+        const chromePath = findChrome(cacheDir);
+        if (chromePath) {
+            console.log(`[Puppeteer] Dynamically resolved Chrome binary: ${chromePath}`);
+            return chromePath;
+        }
+    }
+    return process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
+}
+
 const puppeteerOptions = {
     headless: true,
+    executablePath: getExecutablePath(),
     args: puppeteerArgs
 };
-
-if (process.platform === 'win32' && fs.existsSync('C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe')) {
-    puppeteerOptions.executablePath = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-} else if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    puppeteerOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-}
 
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './auth_info' }),
