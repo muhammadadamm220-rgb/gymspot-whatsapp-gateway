@@ -109,7 +109,7 @@ const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './auth_info' }),
     webVersionCache: {
         type: 'remote',
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html'
+        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1012678663-alpha.html'
     },
     puppeteer: puppeteerOptions
 });
@@ -122,16 +122,18 @@ client.on('qr', (qr) => {
     console.log('=======================================================\n');
 });
 
+client.on('authenticated', () => {
+    latestQr = "";
+    connectionStatus = "connected";
+    console.log('🎉 WhatsApp Client Authenticated successfully!');
+});
+
 client.on('ready', () => {
     latestQr = "";
     connectionStatus = "connected";
     console.log('\n=======================================================');
     console.log('🎉 SUCCESS! WhatsApp Gateway is CONNECTED & READY!');
     console.log('=======================================================\n');
-});
-
-client.on('authenticated', () => {
-    console.log('WhatsApp Client Authenticated successfully!');
 });
 
 client.on('auth_failure', msg => {
