@@ -61,7 +61,9 @@ const puppeteerArgs = [
     '--disable-accelerated-2d-canvas',
     '--no-first-run',
     '--no-zygote',
+    '--single-process',
     '--disable-gpu',
+    '--disable-extensions',
     '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 ];
 
@@ -107,10 +109,8 @@ const puppeteerOptions = {
 
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './auth_info' }),
-    webVersionCache: {
-        type: 'remote',
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1012678663-alpha.html'
-    },
+    takeoverOnConflict: true,
+    takeoverTimeoutMs: 0,
     puppeteer: puppeteerOptions
 });
 
