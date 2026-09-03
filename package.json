@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "postinstall": "npx puppeteer browsers install chrome --path ./cache/puppeteer"
+    "postinstall": "node install-chrome.js"
   },
   "dependencies": {
     "whatsapp-web.js": "^1.23.0",
