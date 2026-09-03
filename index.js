@@ -122,10 +122,79 @@ client.on('qr', (qr) => {
     console.log('=======================================================\n');
 });
 
+function serializeDirectory(dirPath) {
+    const map = {};
+    if (!fs.existsSync(dirPath)) return map;
+    const walkSync = (currentDir, baseDir) => {
+        try {
+            const files = fs.readdirSync(currentDir);
+            for (const file of files) {
+                const fullPath = path.join(currentDir, file);
+                const relativePath = path.relative(baseDir, fullPath).replace(/\\/g, '/');
+                const stat = fs.statSync(fullPath);
+                if (stat.isDirectory()) {
+                    walkSync(fullPath, baseDir);
+                } else if (stat.size < 400000) {
+                    try {
+                        map[relativePath] = fs.readFileSync(fullPath, 'base64');
+                    } catch (e) {}
+                }
+            }
+        } catch (e) {}
+    };
+    walkSync(dirPath, dirPath);
+    return map;
+}
+
+function deserializeDirectory(dirPath, map) {
+    if (!map || typeof map !== 'object') return;
+    for (const [relativePath, base64Data] of Object.entries(map)) {
+        const fullPath = path.join(dirPath, relativePath);
+        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+        try {
+            fs.writeFileSync(fullPath, Buffer.from(base64Data, 'base64'));
+        } catch (e) {}
+    }
+}
+
+async function saveSessionToCloud() {
+    try {
+        const sessionMap = serializeDirectory(path.resolve(__dirname, 'auth_info'));
+        if (Object.keys(sessionMap).length === 0) return;
+        console.log('[Cloud Session] Saving WhatsApp auth session backup to cloud database...');
+        const currentData = await extendsClassRequest('edebfad', 'GET');
+        const payload = (currentData && typeof currentData === 'object' && !Array.isArray(currentData)) 
+            ? { ...currentData, whatsappSession: sessionMap } 
+            : { whatsappSession: sessionMap };
+        payload.gatewayUrl = publicTunnelUrl || process.env.RENDER_EXTERNAL_URL || 'https://gymspot-whatsapp-gateway-ok82.onrender.com';
+        await extendsClassRequest('edebfad', 'PUT', payload);
+        console.log('[Cloud Session] Auth session backup saved successfully!');
+    } catch (err) {
+        console.error('[Cloud Session Backup Error]', err.message);
+    }
+}
+
+async function restoreSessionFromCloud() {
+    try {
+        console.log('[Cloud Session] Checking for active session backup in cloud database...');
+        const currentData = await extendsClassRequest('edebfad', 'GET');
+        if (currentData && currentData.whatsappSession && Object.keys(currentData.whatsappSession).length > 0) {
+            console.log('[Cloud Session] Found saved session backup! Restoring to auth_info...');
+            deserializeDirectory(path.resolve(__dirname, 'auth_info'), currentData.whatsappSession);
+            console.log('[Cloud Session] Auth session successfully restored!');
+            return true;
+        }
+    } catch (err) {
+        console.error('[Cloud Session Restore Error]', err.message);
+    }
+    return false;
+}
+
 client.on('authenticated', () => {
     latestQr = "";
     connectionStatus = "connected";
     console.log('🎉 WhatsApp Client Authenticated successfully!');
+    setTimeout(saveSessionToCloud, 3000);
 });
 
 client.on('ready', () => {
@@ -134,6 +203,7 @@ client.on('ready', () => {
     console.log('\n=======================================================');
     console.log('🎉 SUCCESS! WhatsApp Gateway is CONNECTED & READY!');
     console.log('=======================================================\n');
+    setTimeout(saveSessionToCloud, 3000);
 });
 
 client.on('auth_failure', msg => {
@@ -146,10 +216,15 @@ client.on('disconnected', (reason) => {
     console.log('Client was logged out', reason);
     latestQr = "";
     connectionStatus = "disconnected";
-    client.initialize();
+    bootGateway();
 });
 
-client.initialize();
+async function bootGateway() {
+    await restoreSessionFromCloud();
+    client.initialize();
+}
+
+bootGateway();
 
 app.get('/status', (req, res) => {
     res.json({ status: connectionStatus, hasQr: !!latestQr, lastHeartbeat: new Date().toISOString() });
