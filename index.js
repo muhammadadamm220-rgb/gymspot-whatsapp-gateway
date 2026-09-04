@@ -1,12 +1,11 @@
-const path = require('path');
-if (!process.env.PUPPETEER_CACHE_DIR) {
-    process.env.PUPPETEER_CACHE_DIR = path.resolve(__dirname, '.cache', 'puppeteer');
-}
-
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const pino = require('pino');
 const express = require('express');
 const cors = require('cors');
 const qrcode = require('qrcode');
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
 
 const gatewayLogs = [];
 const originalLog = console.log;
@@ -21,222 +20,168 @@ console.error = (...args) => {
     gatewayLogs.push({ timestamp: new Date().toISOString(), type: 'error', message: args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') });
     if (gatewayLogs.length > 50) gatewayLogs.shift();
 };
-const originalWarn = console.warn;
-console.warn = (...args) => {
-    originalWarn(...args);
-    gatewayLogs.push({ timestamp: new Date().toISOString(), type: 'warning', message: args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') });
-    if (gatewayLogs.length > 50) gatewayLogs.shift();
-};
 
 const app = express();
-
-// Full CORS & Private Network Access for Chrome HTTPS -> Localhost
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, Bypass-Tunnel-Reminder, bypass-tunnel-reminder");
     res.header("Access-Control-Allow-Private-Network", "true");
-    if (req.method === "OPTIONS") {
-        return res.sendStatus(200);
-    }
+    if (req.method === "OPTIONS") return res.sendStatus(200);
     next();
 });
 
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Bypass-Tunnel-Reminder', 'bypass-tunnel-reminder']
-}));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'] }));
 app.use(express.json());
-
-const fs = require('fs');
 
 let latestQr = "";
 let connectionStatus = "disconnected";
+let sock = null;
 
-const puppeteerArgs = [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-accelerated-2d-canvas',
-    '--no-first-run',
-    '--no-zygote',
-    '--single-process',
-    '--disable-gpu',
-    '--disable-extensions',
-    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-];
+const SESSION_DIR = path.resolve(__dirname, 'auth_info');
 
-function getExecutablePath() {
-    if (process.platform === 'win32') {
-        const winChrome = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-        if (fs.existsSync(winChrome)) return winChrome;
-    }
-    
-    // Check bundled cache path in Linux/Render
-    const cacheDir = path.resolve(__dirname, 'cache', 'puppeteer');
-    if (fs.existsSync(cacheDir)) {
-        const findChrome = (dir) => {
-            try {
-                const files = fs.readdirSync(dir);
-                for (const file of files) {
-                    const fullPath = path.join(dir, file);
-                    const stat = fs.statSync(fullPath);
-                    if (stat.isDirectory()) {
-                        const found = findChrome(fullPath);
-                        if (found) return found;
-                    } else if (file === 'chrome' || file === 'chrome.exe') {
-                        return fullPath;
-                    }
-                }
-            } catch (e) {}
-            return null;
-        };
-        const chromePath = findChrome(cacheDir);
-        if (chromePath) {
-            console.log(`[Puppeteer] Dynamically resolved Chrome binary: ${chromePath}`);
-            return chromePath;
-        }
-    }
-    return process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-}
-
-const puppeteerOptions = {
-    headless: true,
-    executablePath: getExecutablePath(),
-    args: puppeteerArgs
-};
-
-const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: './auth_info' }),
-    takeoverOnConflict: true,
-    takeoverTimeoutMs: 0,
-    puppeteer: puppeteerOptions
-});
-
-client.on('qr', (qr) => {
-    latestQr = qr;
-    connectionStatus = "disconnected";
-    console.log('\n=======================================================');
-    console.log('--> NEW QR CODE READY! Open http://localhost:4000/qr to scan.');
-    console.log('=======================================================\n');
-});
-
-function serializeDirectory(dirPath) {
-    const map = {};
-    if (!fs.existsSync(dirPath)) return map;
-    const walkSync = (currentDir, baseDir) => {
-        try {
-            const files = fs.readdirSync(currentDir);
-            for (const file of files) {
-                const fullPath = path.join(currentDir, file);
-                const relativePath = path.relative(baseDir, fullPath).replace(/\\/g, '/');
-                
-                // Exclude heavy temporary browser caches & binary dumps
-                if (relativePath.includes('Cache') || 
-                    relativePath.includes('Service Worker') || 
-                    relativePath.includes('GPU') || 
-                    relativePath.includes('Crash') ||
-                    relativePath.includes('Blob') ||
-                    relativePath.includes('Translate') ||
-                    relativePath.includes('Wasm')) {
-                    continue;
-                }
-
-                const stat = fs.statSync(fullPath);
-                if (stat.isDirectory()) {
-                    walkSync(fullPath, baseDir);
-                } else if (stat.size < 200000) { // Keep essential small auth files
-                    try {
-                        map[relativePath] = fs.readFileSync(fullPath, 'base64');
-                    } catch (e) {}
-                }
+function extendsClassRequest(binId, method, data = null) {
+    return new Promise((resolve, reject) => {
+        const payload = data ? JSON.stringify(data) : null;
+        const options = {
+            hostname: 'extendsclass.com',
+            port: 443,
+            path: method === 'GET' ? `/bin/${binId}?t=${Date.now()}` : `/bin/${binId}`,
+            method: method,
+            headers: {
+                'Content-Type': 'application/json',
+                'cache-control': 'no-cache'
             }
-        } catch (e) {}
-    };
-    walkSync(dirPath, dirPath);
-    return map;
-}
+        };
+        if (payload) options.headers['Content-Length'] = Buffer.byteLength(payload);
 
-function deserializeDirectory(dirPath, map) {
-    if (!map || typeof map !== 'object') return;
-    for (const [relativePath, base64Data] of Object.entries(map)) {
-        const fullPath = path.join(dirPath, relativePath);
-        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-        try {
-            fs.writeFileSync(fullPath, Buffer.from(base64Data, 'base64'));
-        } catch (e) {}
-    }
+        const req = https.request(options, (res) => {
+            let body = '';
+            res.on('data', (chunk) => body += chunk);
+            res.on('end', () => {
+                try { resolve(JSON.parse(body)); } catch (e) { resolve(body); }
+            });
+        });
+        req.on('error', (err) => reject(err));
+        if (payload) req.write(payload);
+        req.end();
+    });
 }
 
 async function saveSessionToCloud() {
     try {
-        const sessionMap = serializeDirectory(path.resolve(__dirname, 'auth_info'));
-        if (Object.keys(sessionMap).length === 0) return;
-        console.log('[Cloud Session] Saving WhatsApp auth session backup to cloud database...');
+        if (!fs.existsSync(SESSION_DIR)) return;
+        const map = {};
+        const files = fs.readdirSync(SESSION_DIR);
+        for (const file of files) {
+            const fullPath = path.join(SESSION_DIR, file);
+            if (fs.statSync(fullPath).isFile()) {
+                map[file] = fs.readFileSync(fullPath, 'utf8');
+            }
+        }
+        if (Object.keys(map).length === 0) return;
+        console.log('[Cloud Session] Backing up WhatsApp session keys to cloud database...');
         const currentData = await extendsClassRequest('edebfad', 'GET');
         const payload = (currentData && typeof currentData === 'object' && !Array.isArray(currentData)) 
-            ? { ...currentData, whatsappSession: sessionMap } 
-            : { whatsappSession: sessionMap };
-        payload.gatewayUrl = publicTunnelUrl || process.env.RENDER_EXTERNAL_URL || 'https://gymspot-whatsapp-gateway-ok82.onrender.com';
+            ? { ...currentData, baileysSession: map } 
+            : { baileysSession: map };
+        payload.gatewayUrl = process.env.RENDER_EXTERNAL_URL || 'https://gymspot-whatsapp-gateway-ok82.onrender.com';
         await extendsClassRequest('edebfad', 'PUT', payload);
-        console.log('[Cloud Session] Auth session backup saved successfully!');
-    } catch (err) {
-        console.error('[Cloud Session Backup Error]', err.message);
+        console.log('[Cloud Session] Session keys successfully backed up to cloud database!');
+    } catch (e) {
+        console.error('[Cloud Session Error]', e.message);
     }
 }
 
 async function restoreSessionFromCloud() {
     try {
-        console.log('[Cloud Session] Checking for active session backup in cloud database...');
+        console.log('[Cloud Session] Restoring session backup from cloud database...');
         const currentData = await extendsClassRequest('edebfad', 'GET');
-        if (currentData && currentData.whatsappSession && Object.keys(currentData.whatsappSession).length > 0) {
-            console.log('[Cloud Session] Found saved session backup! Restoring to auth_info...');
-            deserializeDirectory(path.resolve(__dirname, 'auth_info'), currentData.whatsappSession);
-            console.log('[Cloud Session] Auth session successfully restored!');
+        if (currentData && currentData.baileysSession && Object.keys(currentData.baileysSession).length > 0) {
+            fs.mkdirSync(SESSION_DIR, { recursive: true });
+            for (const [file, content] of Object.entries(currentData.baileysSession)) {
+                fs.writeFileSync(path.join(SESSION_DIR, file), content, 'utf8');
+            }
+            console.log('[Cloud Session] Session restored successfully!');
             return true;
         }
-    } catch (err) {
-        console.error('[Cloud Session Restore Error]', err.message);
+    } catch (e) {
+        console.error('[Cloud Session Restore Error]', e.message);
     }
     return false;
 }
 
-client.on('authenticated', () => {
-    latestQr = "";
-    connectionStatus = "connected";
-    console.log('🎉 WhatsApp Client Authenticated successfully!');
-    setTimeout(saveSessionToCloud, 3000);
-});
-
-client.on('ready', () => {
-    latestQr = "";
-    connectionStatus = "connected";
-    console.log('\n=======================================================');
-    console.log('🎉 SUCCESS! WhatsApp Gateway is CONNECTED & READY!');
-    console.log('=======================================================\n');
-    setTimeout(saveSessionToCloud, 3000);
-});
-
-client.on('auth_failure', msg => {
-    console.error('AUTHENTICATION FAILURE', msg);
-    latestQr = "";
-    connectionStatus = "disconnected";
-});
-
-client.on('disconnected', (reason) => {
-    console.log('Client was logged out', reason);
-    latestQr = "";
-    connectionStatus = "disconnected";
-    bootGateway();
-});
-
-async function bootGateway() {
-    await restoreSessionFromCloud();
-    client.initialize();
+async function publishCloudUrl(url) {
+    try {
+        const currentData = await extendsClassRequest('edebfad', 'GET');
+        const payload = (currentData && typeof currentData === 'object' && !Array.isArray(currentData)) 
+            ? { ...currentData, gatewayUrl: url } 
+            : { gatewayUrl: url };
+        await extendsClassRequest('edebfad', 'PUT', payload);
+        console.log('[Cloud Sync] Published gateway URL to cloud:', url);
+    } catch (err) {
+        console.error('[Cloud Sync Fail]', err.message);
+    }
 }
 
-bootGateway();
+async function startWhatsApp() {
+    await restoreSessionFromCloud();
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
+
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+    let version = [2, 3000, 1015901307];
+    try {
+        const res = await fetchLatestBaileysVersion();
+        version = res.version;
+    } catch (e) {}
+
+    sock = makeWASocket({
+        version,
+        auth: state,
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: false,
+        browser: ['GymSpot Gateway', 'Chrome', '1.0.0']
+    });
+
+    sock.ev.on('creds.update', async () => {
+        await saveCreds();
+        await saveSessionToCloud();
+    });
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) {
+            latestQr = qr;
+            connectionStatus = 'disconnected';
+            console.log('\n=======================================================');
+            console.log('--> FAST QR CODE READY! Scan via http://.../qr');
+            console.log('=======================================================\n');
+        }
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            console.log(`[Baileys] Connection closed (code ${statusCode}). Reconnecting: ${shouldReconnect}`);
+            connectionStatus = 'disconnected';
+            if (shouldReconnect) {
+                setTimeout(startWhatsApp, 3000);
+            } else {
+                console.log('[Baileys] Logged out. Clearing local session...');
+                latestQr = '';
+                try { fs.rmSync(SESSION_DIR, { recursive: true, force: true }); } catch (e) {}
+                setTimeout(startWhatsApp, 2000);
+            }
+        } else if (connection === 'open') {
+            console.log('\n=======================================================');
+            console.log('🎉 SUCCESS! WhatsApp Gateway is CONNECTED & READY!');
+            console.log('=======================================================\n');
+            connectionStatus = 'connected';
+            latestQr = '';
+            await saveSessionToCloud();
+        }
+    });
+}
+
+startWhatsApp();
 
 app.get('/status', (req, res) => {
     res.json({ status: connectionStatus, hasQr: !!latestQr, lastHeartbeat: new Date().toISOString() });
@@ -248,182 +193,42 @@ app.get('/logs', (req, res) => {
 
 app.post('/restart', async (req, res) => {
     try {
-        console.log('[Restart Gateway Triggered] Soft rebooting client & tunnel...');
-        startTunnel();
-        try {
-            await client.destroy();
-        } catch (e) {}
-        client.initialize();
-        res.json({ success: true, message: "Gateway soft-reboot initiated successfully." });
+        console.log('[Restart Gateway Triggered] Rebooting Baileys socket...');
+        if (sock) {
+            try { sock.end(new Error('Manual Reboot')); } catch (e) {}
+        }
+        setTimeout(startWhatsApp, 1000);
+        res.json({ success: true, message: "Gateway reboot initiated successfully." });
     } catch (err) {
-        console.error('Failed to restart gateway:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
 app.get('/qr', async (req, res) => {
     if (connectionStatus === 'connected') {
-        return res.send("<div style='text-align:center;padding:50px;font-family:sans-serif;'><h1 style='color:green;'>✅ WhatsApp is Connected & Active!</h1><p>You can test sending OTPs now.</p></div>");
+        return res.send("<div style='text-align:center;padding:50px;font-family:sans-serif;'><h1 style='color:green;'>✅ WhatsApp is Connected & Active!</h1><p>You can close this tab now. The server will stay connected 24/7 in the cloud.</p></div>");
     }
     if (!latestQr) {
-        return res.send("<div style='text-align:center;padding:50px;font-family:sans-serif;'><h2>Starting WhatsApp engine, please wait 10 seconds...</h2><script>setTimeout(()=>location.reload(), 3000)</script></div>");
+        return res.send("<div style='text-align:center;padding:50px;font-family:sans-serif;'><h2>Starting WhatsApp engine, please wait 3 seconds...</h2><script>setTimeout(()=>location.reload(), 2000)</script></div>");
     }
     try {
         const qrImage = await qrcode.toDataURL(latestQr);
-        res.send(`<div style="text-align:center;padding:40px;font-family:sans-serif;"><h2>Scan this QR Code with your WhatsApp:</h2><img src="${qrImage}" width="300"/><p>Open WhatsApp -> Linked Devices -> Link a Device.</p><script>setInterval(async()=>{ const r=await fetch('/status'); const d=await r.json(); if(d.status==='connected') location.reload(); }, 2000);</script></div>`);
+        res.send(`<div style="text-align:center;padding:40px;font-family:sans-serif;"><h2>Scan this QR Code with your WhatsApp:</h2><img src="${qrImage}" width="300"/><p>Open WhatsApp -> Linked Devices -> Link a Device.</p><script>setInterval(async()=>{ const r=await fetch('/status'); const d=await r.json(); if(d.status==='connected') location.reload(); }, 1500);</script></div>`);
     } catch (err) {
         res.status(500).send("Error generating QR.");
     }
 });
 
-const https = require('https');
-
-function extendsClassRequest(binId, method, data = null) {
-    return new Promise((resolve, reject) => {
-        const payload = data ? JSON.stringify(data) : null;
-        const options = {
-            hostname: 'json.extendsclass.com',
-            port: 443,
-            path: method === 'GET' ? `/bin/${binId}?t=${Date.now()}` : `/bin/${binId}`,
-            method: method,
-            headers: {
-                'Content-Type': 'application/json',
-                'cache-control': 'no-cache'
-            }
-        };
-        if (payload) {
-            options.headers['Content-Length'] = Buffer.byteLength(payload);
-        }
-
-        const req = https.request(options, (res) => {
-            let body = '';
-            res.on('data', (chunk) => body += chunk);
-            res.on('end', () => {
-                try {
-                    resolve(JSON.parse(body));
-                } catch (e) {
-                    resolve(body);
-                }
-            });
-        });
-
-        req.on('error', (err) => reject(err));
-
-        if (payload) {
-            req.write(payload);
-        }
-        req.end();
-    });
-}
-
-app.post('/sync-member', async (req, res) => {
-    const { member } = req.body;
-    if (!member || !member.id) {
-        return res.status(400).json({ error: 'Invalid member data' });
-    }
-    try {
-        console.log(`[Cloud-Sync Initiated] for Member ID: ${member.id}`);
-        // 1. Fetch current cloud data
-        const currentData = await extendsClassRequest('edebfad', 'GET');
-        const cloudMembers = currentData && Array.isArray(currentData.members) ? currentData.members : [];
-        
-        // 2. Filter duplicates & prepend new member
-        const filteredCloud = cloudMembers.filter((m) => m && m.id !== member.id);
-        const updatedCloud = [member, ...filteredCloud];
-
-        // 3. Write back to extendsclass cloud bin (preserving all other fields)
-        await extendsClassRequest('edebfad', 'PUT', { 
-            ...currentData,
-            members: updatedCloud
-        });
-        console.log(`[Cloud-Sync Success] for Member ID: ${member.id}`);
-        res.json({ success: true });
-    } catch (err) {
-        console.error('Cloud sync error in gateway:', err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/register-gym', async (req, res) => {
-    const { gym } = req.body;
-    if (!gym || !gym.id) {
-        return res.status(400).json({ error: 'Invalid gym data' });
-    }
-    try {
-        console.log(`[Cloud-Gym-Registration Initiated] for Gym ID: ${gym.id}`);
-        const currentData = await extendsClassRequest('edebfad', 'GET');
-        const registeredGyms = currentData && Array.isArray(currentData.registeredGyms) ? currentData.registeredGyms : [];
-        const filteredGyms = registeredGyms.filter((g) => g && g.id !== gym.id);
-        const updatedGyms = [gym, ...filteredGyms];
-        
-        await extendsClassRequest('edebfad', 'PUT', { 
-            ...currentData,
-            registeredGyms: updatedGyms
-        });
-        console.log(`[Cloud-Gym-Registration Success] for Gym ID: ${gym.id}`);
-        res.json({ success: true });
-    } catch (err) {
-        console.error('Cloud register sync error in gateway:', err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/sync-admin-overrides', async (req, res) => {
-    const { overrides } = req.body;
-    if (!overrides) {
-        return res.status(400).json({ error: 'Invalid overrides data' });
-    }
-    try {
-        console.log(`[Cloud-Overrides-Sync Initiated]`);
-        const currentData = await extendsClassRequest('edebfad', 'GET');
-        
-        await extendsClassRequest('edebfad', 'PUT', { 
-            ...currentData,
-            adminOverrides: overrides
-        });
-        console.log(`[Cloud-Overrides-Sync Success]`);
-        res.json({ success: true });
-    } catch (err) {
-        console.error('Cloud overrides sync error in gateway:', err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/sync-attendance', async (req, res) => {
-    const { attendance } = req.body;
-    if (!attendance || !attendance.id) {
-        return res.status(400).json({ error: 'Invalid attendance data' });
-    }
-    try {
-        console.log(`[Cloud-Attendance-Sync Initiated] for ID: ${attendance.id}`);
-        // 1. Fetch current cloud data
-        const currentData = await extendsClassRequest('adcbebb', 'GET');
-        const cloudLogs = currentData && Array.isArray(currentData.logs) ? currentData.logs : [];
-        
-        // 2. Filter duplicates & prepend new log (keep last 100)
-        const filteredLogs = cloudLogs.filter((l) => l && l.id !== attendance.id);
-        const updatedLogs = [attendance, ...filteredLogs].slice(0, 100);
-
-        // 3. Write back to extendsclass cloud bin
-        await extendsClassRequest('adcbebb', 'PUT', { logs: updatedLogs });
-        console.log(`[Cloud-Attendance-Sync Success] for ID: ${attendance.id}`);
-        res.json({ success: true });
-    } catch (err) {
-        console.error('Cloud attendance sync error in gateway:', err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
 app.post('/send-message', async (req, res) => {
     const { phone, message } = req.body;
-    if (connectionStatus !== 'connected') {
-        return res.status(503).json({ error: 'WhatsApp is not connected yet. Open http://localhost:4000/qr' });
+    if (connectionStatus !== 'connected' || !sock) {
+        return res.status(503).json({ error: 'WhatsApp is not connected yet.' });
     }
     try {
-        let cleanPhone = phone === 'me' ? client.info.wid.user : phone.trim().replace(/[^0-9]/g, '');
+        let cleanPhone = phone === 'me' ? sock.user.id.split(':')[0] : phone.trim().replace(/[^0-9]/g, '');
         if (cleanPhone.startsWith('0')) cleanPhone = '92' + cleanPhone.substring(1);
-        let formattedPhone = cleanPhone.includes('@c.us') ? cleanPhone : `${cleanPhone}@c.us`;
-        await client.sendMessage(formattedPhone, message);
+        let formattedJid = cleanPhone.includes('@s.whatsapp.net') ? cleanPhone : `${cleanPhone}@s.whatsapp.net`;
+        await sock.sendMessage(formattedJid, { text: message });
         console.log(`[Auto-Msg Sent] -> ${cleanPhone}`);
         res.json({ success: true, sentTo: cleanPhone });
     } catch (err) {
@@ -432,122 +237,44 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
+app.post('/sync-member', async (req, res) => {
+    const { member } = req.body;
+    if (!member || !member.id) return res.status(400).json({ error: 'Invalid member data' });
+    try {
+        const currentData = await extendsClassRequest('edebfad', 'GET');
+        const cloudMembers = currentData && Array.isArray(currentData.members) ? currentData.members : [];
+        const filteredCloud = cloudMembers.filter((m) => m && m.id !== member.id);
+        const updatedCloud = [member, ...filteredCloud];
+        const payload = (currentData && typeof currentData === 'object' && !Array.isArray(currentData)) 
+            ? { ...currentData, members: updatedCloud } 
+            : { members: updatedCloud };
+        await extendsClassRequest('edebfad', 'PUT', payload);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/sync-attendance', async (req, res) => {
+    const { attendance } = req.body;
+    if (!attendance || !attendance.id) return res.status(400).json({ error: 'Invalid attendance data' });
+    try {
+        const currentData = await extendsClassRequest('adcbebb', 'GET');
+        const cloudLogs = currentData && Array.isArray(currentData.logs) ? currentData.logs : [];
+        const filteredLogs = cloudLogs.filter((l) => l && l.id !== attendance.id);
+        const updatedLogs = [attendance, ...filteredLogs].slice(0, 100);
+        await extendsClassRequest('adcbebb', 'PUT', { logs: updatedLogs });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
     console.log(`\n=======================================================`);
-    console.log(`GymSpot Gateway running on port ${PORT}`);
-    console.log(`Status URL: http://localhost:${PORT}/status`);
-    console.log(`QR Code URL: http://localhost:${PORT}/qr`);
+    console.log(`GymSpot Baileys Gateway running on port ${PORT}`);
     console.log(`=======================================================\n`);
-    
-    if (process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL) {
-        publicTunnelUrl = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL;
-        console.log(`\n🎉 [Cloud Gateway Public URL] -> ${publicTunnelUrl}\n`);
-        publishCloudUrl(publicTunnelUrl);
-    } else {
-        startTunnel();
-    }
+    const pubUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    publishCloudUrl(pubUrl);
 });
-
-const { exec } = require('child_process');
-let publicTunnelUrl = '';
-let ltProcess = null;
-let consecutiveFailures = 0;
-
-async function publishCloudUrl(url) {
-    try {
-        const currentData = await extendsClassRequest('edebfad', 'GET');
-        await extendsClassRequest('edebfad', 'PUT', { 
-            ...currentData,
-            gatewayUrl: url
-        });
-        console.log('[Cloud Sync] Successfully published public URL to cloud database:', url);
-    } catch (err) {
-        console.error('[Cloud Sync] Failed to publish URL to cloud:', err.message);
-    }
-}
-
-const killProcessTree = (pid) => {
-    if (process.platform !== 'win32') return;
-    try {
-        console.log(`[Tunnel Kill] Terminating process tree for PID ${pid}...`);
-        exec(`taskkill /pid ${pid} /f /t`, (err) => {
-            if (err) {
-                console.warn(`[Tunnel Kill Info] taskkill reported: ${err.message}`);
-            } else {
-                console.log(`[Tunnel Kill Success] Process tree for PID ${pid} terminated.`);
-            }
-        });
-    } catch (e) {
-        console.error('[Tunnel Kill Exception] Failed to execute taskkill:', e);
-    }
-};
-
-function startTunnel() {
-    if (process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL) {
-        return; // Localtunnel not needed in production cloud hosts
-    }
-    console.log('[Tunnel] Starting localtunnel on port 4000...');
-    if (ltProcess) {
-        try {
-            killProcessTree(ltProcess.pid);
-        } catch (e) {}
-        ltProcess = null;
-    }
-
-    const lt = exec('npx -y localtunnel --port 4000');
-    ltProcess = lt;
-    
-    const handleOutput = async (data) => {
-        const output = data.toString();
-        console.log(`[Tunnel Log] ${output.trim()}`);
-        const match = output.match(/your url is: (https:\/\/[a-z0-9.-]+\.loca\.lt)/i);
-        if (match) {
-            publicTunnelUrl = match[1];
-            console.log(`\n🎉 [Public Gateway URL] -> ${publicTunnelUrl}\n`);
-            publishCloudUrl(publicTunnelUrl);
-        }
-    };
-
-    lt.stdout.on('data', handleOutput);
-    lt.stderr.on('data', handleOutput);
-
-    lt.on('close', (code) => {
-        console.log(`[Tunnel] Process exited with code ${code}. Restarting in 5 seconds...`);
-        ltProcess = null;
-        setTimeout(startTunnel, 5000);
-    });
-}
-
-// Self-healing tunnel health check: Ping the tunnel status endpoint every 45 seconds
-setInterval(async () => {
-    if (publicTunnelUrl && ltProcess) {
-        try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s request timeout
-            const res = await fetch(`${publicTunnelUrl}/status`, {
-                signal: controller.signal,
-                headers: { "bypass-tunnel-reminder": "true" }
-            });
-            clearTimeout(timeoutId);
-            if (res.status === 200) {
-                consecutiveFailures = 0; // reset
-                return;
-            }
-            throw new Error(`Status ${res.status}`);
-        } catch (err) {
-            consecutiveFailures++;
-            console.warn(`[Tunnel Health Check] Warning: Tunnel ping failed (${err.message}). Failure count: ${consecutiveFailures}/3`);
-            
-            if (consecutiveFailures >= 3) {
-                console.error(`[Tunnel Health Check] Tunnel failed 3 consecutive times. Restarting process tree...`);
-                publicTunnelUrl = '';
-                consecutiveFailures = 0;
-                if (ltProcess) {
-                    killProcessTree(ltProcess.pid);
-                }
-            }
-        }
-    }
-}, 45000);
