@@ -131,10 +131,22 @@ function serializeDirectory(dirPath) {
             for (const file of files) {
                 const fullPath = path.join(currentDir, file);
                 const relativePath = path.relative(baseDir, fullPath).replace(/\\/g, '/');
+                
+                // Exclude heavy temporary browser caches & binary dumps
+                if (relativePath.includes('Cache') || 
+                    relativePath.includes('Service Worker') || 
+                    relativePath.includes('GPU') || 
+                    relativePath.includes('Crash') ||
+                    relativePath.includes('Blob') ||
+                    relativePath.includes('Translate') ||
+                    relativePath.includes('Wasm')) {
+                    continue;
+                }
+
                 const stat = fs.statSync(fullPath);
                 if (stat.isDirectory()) {
                     walkSync(fullPath, baseDir);
-                } else if (stat.size < 400000) {
+                } else if (stat.size < 200000) { // Keep essential small auth files
                     try {
                         map[relativePath] = fs.readFileSync(fullPath, 'base64');
                     } catch (e) {}
