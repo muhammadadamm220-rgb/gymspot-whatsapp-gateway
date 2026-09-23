@@ -159,16 +159,21 @@ async function startWhatsApp() {
         }
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            console.log(`[Baileys] Connection closed (code ${statusCode}). Reconnecting: ${shouldReconnect}`);
+            const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+            const isConflict = statusCode === 440;
+            console.log(`[Baileys] Connection closed (code ${statusCode}). Reconnecting: ${!isLoggedOut}`);
             connectionStatus = 'disconnected';
-            if (shouldReconnect) {
-                setTimeout(startWhatsApp, 3000);
-            } else {
-                console.log('[Baileys] Logged out. Clearing local session...');
+            
+            if (isLoggedOut) {
+                console.log('[Baileys] Logged out from WhatsApp. Clearing local session...');
                 latestQr = '';
                 try { fs.rmSync(SESSION_DIR, { recursive: true, force: true }); } catch (e) {}
-                setTimeout(startWhatsApp, 2000);
+                setTimeout(startWhatsApp, 3000);
+            } else if (isConflict) {
+                console.log('[Baileys Conflict] Session conflict detected (code 440). Waiting 12s to prevent ping-pong loop...');
+                setTimeout(startWhatsApp, 12000);
+            } else {
+                setTimeout(startWhatsApp, 3000);
             }
         } else if (connection === 'open') {
             console.log('\n=======================================================');
